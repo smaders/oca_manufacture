@@ -22,7 +22,10 @@ class ProductMRPArea(models.Model):
         store=True,
     )
     product_id = fields.Many2one(
-        comodel_name="product.product", required=True, string="Product"
+        comodel_name="product.product",
+        required=True,
+        string="Product",
+        ondelete="cascade",
     )
     product_tmpl_id = fields.Many2one(
         comodel_name="product.template",
@@ -83,6 +86,11 @@ class ProductMRPArea(models.Model):
             ("push", "Push To"),
             ("pull_push", "Pull & Push"),
         ],
+        compute="_compute_supply_method",
+    )
+    supply_bom_id = fields.Many2one(
+        comodel_name="mrp.bom",
+        string="Supply BoM",
         compute="_compute_supply_method",
     )
     qty_available = fields.Float(
@@ -205,27 +213,36 @@ class ProductMRPArea(models.Model):
         return rule
 
     def _compute_supply_method(self):
+        boms_by_product = self.env["mrp.bom"]._bom_find(self.mapped("product_id"))
         for rec in self:
             rule = rec._get_rule()
-            if not rule:
+            bom = boms_by_product.get(rec.product_id, self.env["mrp.bom"])
+            if bom.type == "phantom":
+                rec.supply_method = "phantom"
+                rec.supply_bom_id = bom
+            elif not rule:
                 rec.supply_method = "none"
-                continue
-            # Determine the supply method based on the final rule.
-            boms = rec.product_id.product_tmpl_id.bom_ids.filtered(
-                lambda x: x.type in ["normal", "phantom"]
-            )
-            rec.supply_method = (
-                "phantom"
-                if rule.action == "manufacture" and boms and boms[0].type == "phantom"
-                else rule.action
-            )
+                rec.supply_bom_id = False
+            elif rule.action == "manufacture":
+                rec.supply_method = rule.action
+                rec.supply_bom_id = bom
+            else:
+                rec.supply_method = rule.action
+                rec.supply_bom_id = False
 
     @api.depends(
-        "mrp_area_id", "supply_method", "product_id.route_ids", "product_id.seller_ids"
+        "mrp_area_id",
+        "product_id.route_ids",
+        "product_id.seller_ids",
+        "location_proc_id",
     )
     def _compute_main_supplier(self):
         """Simplified and similar to procurement.rule logic."""
-        for rec in self.filtered(lambda r: r.supply_method == "buy"):
+        for rec in self:
+            if rec.supply_method != "buy":
+                rec.main_supplierinfo_id = False
+                rec.main_supplier_id = False
+                continue
             suppliers = rec.product_id.seller_ids.filtered(
                 lambda r: (not r.product_id or r.product_id == rec.product_id)
                 and (not r.company_id or r.company_id == rec.company_id)
@@ -236,9 +253,6 @@ class ProductMRPArea(models.Model):
                 continue
             rec.main_supplierinfo_id = suppliers[0]
             rec.main_supplier_id = suppliers[0].partner_id
-        for rec in self.filtered(lambda r: r.supply_method != "buy"):
-            rec.main_supplierinfo_id = False
-            rec.main_supplier_id = False
 
     def _adjust_qty_to_order(self, qty_to_order):
         self.ensure_one()
@@ -310,4 +324,4 @@ class ProductMRPArea(models.Model):
 
     def _should_create_planned_order(self):
         self.ensure_one()
-        return not self.supply_method == "phantom"
+        return True
